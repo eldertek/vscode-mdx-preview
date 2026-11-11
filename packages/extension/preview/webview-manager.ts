@@ -11,43 +11,50 @@ const MDX_PREVIEW_FOCUS_CONTEXT_KEY = 'mdxPreviewFocus';
 let panel: (vscode.WebviewPanel | undefined);
 let panelDoc: (vscode.TextDocument | undefined);
 let disposables: vscode.Disposable[] = [];
+let extensionContext: vscode.ExtensionContext | undefined;
 
-let webviewAppHTMLResources: {
-  styleHref: string;
-  runTimeMainSrc: string;
-  chunkSrc: string;
-  scriptSrc: string;
-} | undefined;
+function toWebviewUri(webview: vscode.Webview, fileUri: vscode.Uri): string {
+    if (typeof webview.asWebviewUri === 'function') {
+        return webview.asWebviewUri(fileUri).toString();
+    }
+    return fileUri.with({ scheme: 'vscode-resource' }).toString(true);
+}
 
 export function initWebviewAppHTMLResources(context: vscode.ExtensionContext) {
-    const { extensionPath } = context;
-    const manifest = require(path.join(extensionPath, 'build', 'webview-app', 'asset-manifest.json'));
-    const mainScript = manifest['main.js'];
-    const mainStyle = manifest['main.css'];
-    const scriptUri = vscode.Uri.file(path.join(extensionPath, 'build', 'webview-app', mainScript))
-        .with({ scheme: 'vscode-resource' });
-    const chunkPath = path.join(extensionPath, 'build', 'webview-app', manifest[Object.keys(manifest).find(key => key.endsWith('chunk.js'))]);
-    const chunkUri = vscode.Uri.file(chunkPath).with({ scheme: 'vscode-resource' });
-    const runTimeMainUri = vscode.Uri.file(path.join(extensionPath, 'build', 'webview-app', manifest['runtime~main.js']))
-        .with({ scheme: 'vscode-resource' });
-    const styleUri = vscode.Uri.file(path.join(extensionPath, 'build', 'webview-app', mainStyle))
-        .with({ scheme: 'vscode-resource' });
-    webviewAppHTMLResources = {
-      styleHref: styleUri.toString(true),
-      runTimeMainSrc: runTimeMainUri.toString(true),
-      chunkSrc: chunkUri.toString(true),
-      scriptSrc: scriptUri.toString(true)
-    };
+    extensionContext = context;
 }
 
 function getWebviewAppHTML(
+    webview: vscode.Webview,
     baseHref: string,
     contentSecurityPolicy: string,
     styleConfiguration: StyleConfiguration
 ) {
-    if (!webviewAppHTMLResources) {
+    if (!extensionContext) {
         return;
     }
+    const { extensionPath } = extensionContext;
+    let mainScript = '';
+    let mainStyle = '';
+    let chunkPath = '';
+    let runtimePath = '';
+
+    try {
+        const manifest = require(path.join(extensionPath, 'build', 'webview-app', 'asset-manifest.json'));
+        mainScript = manifest['main.js'] || '';
+        mainStyle = manifest['main.css'] || '';
+        const chunkKey = Object.keys(manifest).find(key => key.endsWith('chunk.js'));
+        chunkPath = chunkKey ? path.join(extensionPath, 'build', 'webview-app', manifest[chunkKey]) : '';
+        runtimePath = manifest['runtime~main.js'] ? path.join(extensionPath, 'build', 'webview-app', manifest['runtime~main.js']) : '';
+    } catch {
+        // Build files might not exist during tests
+    }
+
+    const styleHref = mainStyle ? toWebviewUri(webview, vscode.Uri.file(path.join(extensionPath, 'build', 'webview-app', mainStyle))) : '';
+    const runTimeMainSrc = runtimePath ? toWebviewUri(webview, vscode.Uri.file(runtimePath)) : '';
+    const chunkSrc = chunkPath ? toWebviewUri(webview, vscode.Uri.file(chunkPath)) : '';
+    const scriptSrc = mainScript ? toWebviewUri(webview, vscode.Uri.file(path.join(extensionPath, 'build', 'webview-app', mainScript))) : '';
+
     const {
       useVscodeMarkdownStyles,
       useWhiteBackground,
@@ -57,8 +64,6 @@ function getWebviewAppHTML(
     color: black;
     background: white;
 }`: '';
-    // We have some styles attached in webview by vscode
-    // If we don't use vscode's markdown styles, remove them
     let overrideDefaultStyles = (!useVscodeMarkdownStyles)
         ? `code {
   color: inherit;
@@ -75,7 +80,6 @@ blockquote {
         styleNodeHTML = '';
     }
 
-    const { styleHref, runTimeMainSrc, chunkSrc, scriptSrc } = webviewAppHTMLResources;
     const webviewAppHTML = `<!DOCTYPE html>
     <html lang="en">
     <head>
@@ -98,7 +102,9 @@ blockquote {
 }
 
 function dispose() {
-    panel.dispose();
+    if (panel) {
+        panel.dispose();
+    }
     while (disposables.length) {
         const disposable = disposables.pop();
         if (disposable) {
@@ -109,20 +115,34 @@ function dispose() {
 }
 
 function setPanelHTMLFromPreview(preview: Preview) {
+    if (!panel) {
+        return;
+    }
     const { doc, styleConfiguration, securityConfiguration } = preview;
-    const previewBaseHref = doc.uri
-        .with({ scheme: 'vscode-resource' })
-        .toString(true);
-    const webviewAppHTML = getWebviewAppHTML(previewBaseHref, getCSP(securityConfiguration), styleConfiguration);
-    panel.webview.html = webviewAppHTML;
+    const previewBaseHref = toWebviewUri(panel.webview, doc.uri);
+    const cspSource = panel.webview.cspSource || 'vscode-resource:';
+    const webviewAppHTML = getWebviewAppHTML(panel.webview, previewBaseHref, getCSP(securityConfiguration, cspSource), styleConfiguration);
+    if (webviewAppHTML) {
+        panel.webview.html = webviewAppHTML;
+    }
 }
 
 export function createOrShowPanel(preview: Preview) {
     const activeTextEditorColumn = vscode.window.activeTextEditor ? vscode.window.activeTextEditor.viewColumn : vscode.ViewColumn.One;
-    const previewColumn = activeTextEditorColumn + 1;// vscode.ViewColumn.Beside || vscode.ViewColumn.One;
+    const previewColumn = (activeTextEditorColumn || vscode.ViewColumn.One) + 1;
     const previewTitle = `Preview ${path.basename(preview.doc.fileName)}`;
 
     if (!panel) {
+        const localRoots = extensionContext ? [
+            vscode.Uri.file(extensionContext.extensionPath),
+            vscode.Uri.file(path.dirname(preview.doc.fileName))
+        ] : undefined;
+        if (localRoots && vscode.workspace.workspaceFolders) {
+            for (const folder of vscode.workspace.workspaceFolders) {
+                localRoots.push(folder.uri);
+            }
+        }
+
         panel = vscode.window.createWebviewPanel(
             VIEW_TYPE,
             previewTitle,
@@ -130,7 +150,8 @@ export function createOrShowPanel(preview: Preview) {
             {
                 enableScripts: true,
                 enableCommandUris: true,
-                retainContextWhenHidden: true
+                retainContextWhenHidden: true,
+                localResourceRoots: localRoots
             }
         );
         panelDoc = preview.doc;
